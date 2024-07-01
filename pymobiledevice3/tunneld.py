@@ -12,6 +12,7 @@ import construct
 import fastapi
 import requests
 import uvicorn
+from construct import StreamError
 from fastapi import FastAPI
 from packaging.version import Version
 
@@ -149,7 +150,9 @@ class TunneldCore:
                                                        protocol=TunnelProtocol.TCP),
                                 name=f'start-tunnel-task-{task_identifier}'))
                 except ConnectionFailedToUsbmuxdError:
-                    logger.warning('failed to connect to usbmux. waiting for it to restart')
+                    # This is exception is expected to occur repeatedly on linux running usbmuxd
+                    # as long as there isn't any physical iDevice connected
+                    logger.debug('failed to connect to usbmux. waiting for it to restart')
                 finally:
                     await asyncio.sleep(USBMUX_INTERVAL)
         except asyncio.CancelledError:
@@ -210,8 +213,8 @@ class TunneldCore:
                         f'since there is already an active one for same udid')
         except asyncio.CancelledError:
             pass
-        except ConnectionResetError:
-            logger.debug(f'got ConnectionResetError from {asyncio.current_task().get_name()}')
+        except (ConnectionResetError, StreamError) as e:
+            logger.debug(f'got {e.__class__.__name__} from {asyncio.current_task().get_name()}')
         except (asyncio.exceptions.IncompleteReadError, TimeoutError, OSError) as e:
             logger.debug(f'got {e.__class__.__name__} from tunnel --rsd {tun.address} {tun.port}')
         except Exception:
@@ -257,7 +260,7 @@ class TunneldCore:
             with stop_remoted():
                 try:
                     await rsd.connect()
-                except ConnectionRefusedError:
+                except (ConnectionRefusedError, TimeoutError):
                     raise asyncio.CancelledError()
 
             if (self.protocol == TunnelProtocol.QUIC) and (Version(rsd.product_version) < Version('17.0.0')):
@@ -353,6 +356,11 @@ class TunneldRunner:
             self._tunneld_core.clear()
             return fastapi.Response(status_code=200, content='Cleared tunnels...')
 
+        @self._app.get('/hello')
+        async def hello() -> fastapi.Response:
+            response = {'message': 'Hello, I\'m alive'}
+            return fastapi.Response(status_code=200, media_type="application/json", content=json.dumps(response))
+
         def generate_tunnel_response(tunnel: TunnelResult) -> fastapi.Response:
             return fastapi.Response(
                 status_code=200,
@@ -429,13 +437,40 @@ class TunneldRunner:
 
 async def async_get_tunneld_devices(tunneld_address: Tuple[str, int] = TUNNELD_DEFAULT_ADDRESS) \
         -> List[RemoteServiceDiscoveryService]:
+    tunnels = _list_tunnels(tunneld_address)
+    return await _create_rsds_from_tunnels(tunnels)
+
+
+def get_tunneld_devices(tunneld_address: Tuple[str, int] = TUNNELD_DEFAULT_ADDRESS) \
+        -> List[RemoteServiceDiscoveryService]:
+    return get_asyncio_loop().run_until_complete(async_get_tunneld_devices(tunneld_address))
+
+
+async def async_get_tunneld_device_by_udid(udid: str, tunneld_address: Tuple[str, int] = TUNNELD_DEFAULT_ADDRESS) \
+        -> Optional[RemoteServiceDiscoveryService]:
+    tunnels = _list_tunnels(tunneld_address)
+    if udid not in tunnels:
+        return None
+    rsds = await _create_rsds_from_tunnels({udid: tunnels[udid]})
+    return rsds[0]
+
+
+def get_tunneld_device_by_udid(udid: str, tunneld_address: Tuple[str, int] = TUNNELD_DEFAULT_ADDRESS) \
+        -> Optional[RemoteServiceDiscoveryService]:
+    return get_asyncio_loop().run_until_complete(async_get_tunneld_device_by_udid(udid, tunneld_address))
+
+
+def _list_tunnels(tunneld_address: Tuple[str, int] = TUNNELD_DEFAULT_ADDRESS) -> Mapping[str, List[Mapping]]:
     try:
         # Get the list of tunnels from the specified address
         resp = requests.get(f'http://{tunneld_address[0]}:{tunneld_address[1]}')
         tunnels = resp.json()
     except requests.exceptions.ConnectionError:
         raise TunneldConnectionError()
+    return tunnels
 
+
+async def _create_rsds_from_tunnels(tunnels: Mapping[str, List[Mapping]]) -> List[RemoteServiceDiscoveryService]:
     rsds = []
     for udid, details in tunnels.items():
         for tunnel_details in details:
@@ -447,8 +482,3 @@ async def async_get_tunneld_devices(tunneld_address: Tuple[str, int] = TUNNELD_D
             except (TimeoutError, ConnectionError):
                 continue
     return rsds
-
-
-def get_tunneld_devices(tunneld_address: Tuple[str, int] = TUNNELD_DEFAULT_ADDRESS) \
-        -> List[RemoteServiceDiscoveryService]:
-    return get_asyncio_loop().run_until_complete(async_get_tunneld_devices(tunneld_address))

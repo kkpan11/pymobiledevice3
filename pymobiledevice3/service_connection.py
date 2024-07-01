@@ -19,6 +19,7 @@ from pymobiledevice3.usbmux import MuxDevice, select_device
 DEFAULT_AFTER_IDLE_SEC = 3
 DEFAULT_INTERVAL_SEC = 3
 DEFAULT_MAX_FAILS = 3
+DEFAULT_TIMEOUT = 1
 OSUTIL = get_os_utils()
 SHELL_USAGE = """
 # This shell allows you to communicate directly with every service layer behind the lockdownd daemon.
@@ -77,8 +78,10 @@ class ServiceConnection:
         self.writer = None  # type: Optional[asyncio.StreamWriter]
 
     @staticmethod
-    def create_using_tcp(hostname: str, port: int, keep_alive: bool = True) -> 'ServiceConnection':
-        sock = socket.create_connection((hostname, port))
+    def create_using_tcp(hostname: str, port: int, keep_alive: bool = True,
+                         create_connection_timeout: int = DEFAULT_TIMEOUT) -> 'ServiceConnection':
+        sock = socket.create_connection((hostname, port), timeout=create_connection_timeout)
+        sock.settimeout(None)
         if keep_alive:
             OSUTIL.set_keepalive(sock)
         return ServiceConnection(sock)
@@ -125,6 +128,10 @@ class ServiceConnection:
         self.send_plist(data, endianity=endianity, fmt=fmt)
         return self.recv_plist(endianity=endianity)
 
+    async def aio_send_recv_plist(self, data: Mapping, endianity='>', fmt=plistlib.FMT_XML) -> Any:
+        await self.aio_send_plist(data, endianity=endianity, fmt=fmt)
+        return await self.aio_recv_plist(endianity=endianity)
+
     def recvall(self, size: int) -> bytes:
         data = b''
         while len(data) < size:
@@ -168,7 +175,7 @@ class ServiceConnection:
     def recv_plist(self, endianity='>') -> Mapping:
         return parse_plist(self.recv_prefixed(endianity=endianity))
 
-    async def aio_recv_plist(self, endianity='>') -> bytes:
+    async def aio_recv_plist(self, endianity='>') -> Mapping:
         return parse_plist(await self.aio_recv_prefixed(endianity))
 
     def send_plist(self, d, endianity='>', fmt=plistlib.FMT_XML) -> None:

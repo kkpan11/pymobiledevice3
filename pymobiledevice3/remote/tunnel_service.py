@@ -67,6 +67,8 @@ from pymobiledevice3.remote.xpc_message import XpcInt64Type, XpcUInt64Type
 from pymobiledevice3.service_connection import ServiceConnection
 from pymobiledevice3.utils import asyncio_print_traceback
 
+TIMEOUT = 1
+
 OSUTIL = get_os_utils()
 LOOPBACK_HEADER = OSUTIL.loopback_header
 logger = logging.getLogger(__name__)
@@ -118,7 +120,7 @@ PairingDataComponentTLV8 = Struct(
 
 PairingDataComponentTLVBuf = GreedyRange(PairingDataComponentTLV8)
 
-PairConsentResult = namedtuple('PairConsentResult', 'public_key salt')
+PairConsentResult = namedtuple('PairConsentResult', 'public_key salt pin')
 
 CDTunnelPacket = Struct(
     'magic' / Const(b'CDTunnel'),
@@ -477,6 +479,10 @@ class RemotePairingProtocol(StartTcpTunnel):
         return self.handshake_info['peerDeviceInfo']['identifier']
 
     @property
+    def remote_device_model(self) -> str:
+        return self.handshake_info['peerDeviceInfo']['model']
+
+    @property
     def pair_record_path(self) -> Path:
         pair_records_cache_directory = create_pairing_records_cache_folder()
         return (pair_records_cache_directory /
@@ -507,6 +513,7 @@ class RemotePairingProtocol(StartTcpTunnel):
         response = await self._receive_plain_response()
         response = response['event']['_0']
 
+        pin = None
         if 'pairingRejectedWithError' in response:
             raise PairingError(
                 response['pairingRejectedWithError']['wrappedError']['userInfo']['NSLocalizedDescription'])
@@ -515,15 +522,20 @@ class RemotePairingProtocol(StartTcpTunnel):
         else:
             # On tvOS no consent is needed and pairing data is returned immediately.
             pairing_data = self._decode_bytes_if_needed(response['pairingData']['_0']['data'])
+            # On tvOS we need pin to setup pairing.
+            if 'AppleTV' in self.remote_device_model:
+                pin = input('Enter PIN: ')
 
         data = self.decode_tlv(PairingDataComponentTLVBuf.parse(pairing_data))
         return PairConsentResult(public_key=data[PairingDataComponentType.PUBLIC_KEY],
-                                 salt=data[PairingDataComponentType.SALT])
+                                 salt=data[PairingDataComponentType.SALT],
+                                 pin=pin)
 
     def _init_srp_context(self, pairing_consent_result: PairConsentResult) -> None:
         # Receive server public and salt and process them.
+        pin = pairing_consent_result.pin or '000000'
         client_session = SRPClientSession(
-            SRPContext('Pair-Setup', password='000000', prime=PRIME_3072, generator=PRIME_3072_GEN,
+            SRPContext('Pair-Setup', password=pin, prime=PRIME_3072, generator=PRIME_3072_GEN,
                        hash_func=hashlib.sha512))
         client_session.process(pairing_consent_result.public_key.hex(),
                                pairing_consent_result.salt.hex())
@@ -632,11 +644,12 @@ class RemotePairingProtocol(StartTcpTunnel):
         self.server_cip = ChaCha20Poly1305(server_key)
 
     async def _create_remote_unlock(self) -> None:
-        response = await self._send_receive_encrypted_request({'request': {'_0': {'createRemoteUnlockKey': {}}}})
-        if 'errorExtended' in response:
-            self.remote_unlock_host_key = None
-        else:
+        try:
+            response = await self._send_receive_encrypted_request({'request': {'_0': {'createRemoteUnlockKey': {}}}})
             self.remote_unlock_host_key = response['createRemoteUnlockKey']['hostKey']
+        except PyMobileDevice3Exception:
+            # tvOS does not support remote unlock.
+            self.remote_unlock_host_key = ''
 
     async def _attempt_pair_verify(self) -> None:
         self.handshake_info = await self._send_receive_handshake({
@@ -828,15 +841,16 @@ class RemotePairingTunnelService(RemotePairingProtocol):
         self._remote_identifier = remote_identifier
         self.hostname = hostname
         self.port = port
-        self._connection: Optional[ServiceConnection] = None
+        self._reader: Optional[StreamReader] = None
+        self._writer: Optional[StreamWriter] = None
 
     @property
     def remote_identifier(self) -> str:
         return self._remote_identifier
 
     async def connect(self, autopair: bool = True) -> None:
-        self._connection = ServiceConnection.create_using_tcp(self.hostname, self.port)
-        await self._connection.aio_start()
+        fut = asyncio.open_connection(self.hostname, self.port)
+        self._reader, self._writer = await asyncio.wait_for(fut, timeout=TIMEOUT)
 
         try:
             await self._attempt_pair_verify()
@@ -844,20 +858,29 @@ class RemotePairingTunnelService(RemotePairingProtocol):
                 raise ConnectionAbortedError()
             self._init_client_server_main_encryption_keys()
         except:  # noqa: E722
-            self._connection.close()
+            await self.close()
             raise
 
     async def close(self) -> None:
-        await self._connection.aio_close()
+        if self._writer is None:
+            return
+        self._writer.close()
+        try:
+            await self._writer.wait_closed()
+        except ssl.SSLError:
+            pass
+        self._writer = None
+        self._reader = None
 
     async def receive_response(self) -> Mapping:
-        await self._connection.aio_recvall(len(REPAIRING_PACKET_MAGIC))
-        size = struct.unpack('>H', await self._connection.aio_recvall(2))[0]
-        return json.loads(await self._connection.aio_recvall(size))
+        await self._reader.readexactly(len(REPAIRING_PACKET_MAGIC))
+        size = struct.unpack('>H', await self._reader.readexactly(2))[0]
+        return json.loads(await self._reader.readexactly(size))
 
     async def send_request(self, data: Mapping) -> None:
-        return await self._connection.aio_sendall(
+        self._writer.write(
             RPPairingPacket.build({'body': json.dumps(data, default=self._default_json_encoder).encode()}))
+        await self._writer.drain()
 
     @staticmethod
     def _default_json_encoder(obj) -> str:
@@ -876,8 +899,8 @@ class RemotePairingTunnelService(RemotePairingProtocol):
 
 class RemotePairingManualPairingService(RemotePairingTunnelService):
     async def connect(self, autopair: bool = True) -> None:
-        self._connection = ServiceConnection.create_using_tcp(self.hostname, self.port)
-        await self._connection.aio_start()
+        fut = asyncio.open_connection(self.hostname, self.port)
+        self._reader, self._writer = await asyncio.wait_for(fut, timeout=TIMEOUT)
         await RemotePairingProtocol.connect(self, autopair=autopair)
 
 

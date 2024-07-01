@@ -8,7 +8,7 @@ import coloredlogs
 from pymobiledevice3.exceptions import AccessDeniedError, ConnectionFailedToUsbmuxdError, DeprecationError, \
     DeveloperModeError, DeveloperModeIsNotEnabledError, DeviceHasPasscodeSetError, DeviceNotFoundError, \
     FeatureNotSupportedError, InternalError, InvalidServiceError, MessageNotSupportedError, MissingValueError, \
-    NoDeviceConnectedError, NoDeviceSelectedError, NotEnoughDiskSpaceError, NotPairedError, OSNotSupportedError, \
+    NoDeviceConnectedError, NotEnoughDiskSpaceError, NotPairedError, OSNotSupportedError, \
     PairingDialogResponsePendingError, PasswordRequiredError, RSDRequiredError, SetProhibitedError, \
     TunneldConnectionError, UserDeniedPairingError
 from pymobiledevice3.osu.os_utils import get_os_utils
@@ -127,16 +127,23 @@ def main() -> None:
         logger.error('Developer Mode is disabled. You can try to enable it using: '
                      'python3 -m pymobiledevice3 amfi enable-developer-mode')
     except (InvalidServiceError, RSDRequiredError) as e:
-        if isinstance(e, InvalidServiceError):
-            logger.warning('Trying again over tunneld since it is a developer command')
-        else:
+        should_retry_over_tunneld = False
+        if isinstance(e, RSDRequiredError):
             logger.warning('Trying again over tunneld since RSD is required for this command')
-        if (e.identifier is not None) and ('developer' in sys.argv) and ('--tunnel' not in sys.argv):
-            sys.argv += ['--tunnel', e.identifier]
+            should_retry_over_tunneld = True
+        elif (e.identifier is not None) and ('developer' in sys.argv) and ('--tunnel' not in sys.argv):
+            logger.warning('Got an InvalidServiceError. Trying again over tunneld since it is a developer command')
+            should_retry_over_tunneld = True
+        if should_retry_over_tunneld:
+            if '--' in sys.argv:
+                escape_sequence = sys.argv.index('--')
+                before = sys.argv[:escape_sequence]
+                after = sys.argv[escape_sequence:]
+                sys.argv = before + ['--tunnel', e.identifier] + after
+            else:
+                sys.argv += ['--tunnel', e.identifier]
             return main()
         logger.error(INVALID_SERVICE_MESSAGE)
-    except NoDeviceSelectedError:
-        return
     except PasswordRequiredError:
         logger.error('Device is password protected. Please unlock and retry')
     except AccessDeniedError:

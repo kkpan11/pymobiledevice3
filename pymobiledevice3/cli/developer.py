@@ -11,7 +11,7 @@ from collections import namedtuple
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import IO, List, Optional, Tuple
 
 import click
 from click.exceptions import MissingParameter, UsageError
@@ -28,6 +28,7 @@ from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.osu.os_utils import get_os_utils
 from pymobiledevice3.remote.core_device.app_service import AppServiceService
 from pymobiledevice3.remote.core_device.device_info import DeviceInfoService
+from pymobiledevice3.remote.core_device.file_service import APPLE_DOMAIN_DICT, FileServiceService
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.services.accessibilityaudit import AccessibilityAudit
 from pymobiledevice3.services.debugserver_applist import DebugServerAppList
@@ -53,6 +54,7 @@ from pymobiledevice3.services.remote_server import RemoteServer
 from pymobiledevice3.services.screenshot import ScreenshotService
 from pymobiledevice3.services.simulate_location import DtSimulateLocation
 from pymobiledevice3.tcp_forwarder import LockdownTcpForwarder
+from pymobiledevice3.utils import try_decode
 
 OSUTILS = get_os_utils()
 BSC_SUBCLASS = 0x40c
@@ -307,7 +309,7 @@ def sysmon_process():
 def sysmon_process_monitor(service_provider: LockdownClient, threshold):
     """ monitor all most consuming processes by given cpuUsage threshold. """
 
-    Process = namedtuple('process', 'pid name cpuUsage')
+    Process = namedtuple('process', 'pid name cpuUsage physFootprint')
 
     with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
         with Sysmontap(dvt) as sysmon:
@@ -315,7 +317,8 @@ def sysmon_process_monitor(service_provider: LockdownClient, threshold):
                 entries = []
                 for process in process_snapshot:
                     if (process['cpuUsage'] is not None) and (process['cpuUsage'] >= threshold):
-                        entries.append(Process(pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage']))
+                        entries.append(Process(pid=process['pid'], name=process['name'], cpuUsage=process['cpuUsage'],
+                                               physFootprint=process['physFootprint']))
 
                 logger.info(entries)
 
@@ -706,9 +709,6 @@ def fetch_symbols_list(service_provider: LockdownServiceProvider) -> None:
 
 
 async def fetch_symbols_download_task(service_provider: LockdownServiceProvider, out: str) -> None:
-    if not isinstance(service_provider, RemoteServiceDiscoveryService):
-        raise ArgumentError('service_provider must be a RemoteServiceDiscoveryService for iOS 17+ devices')
-
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -735,6 +735,8 @@ async def fetch_symbols_download_task(service_provider: LockdownServiceProvider,
                 logger.info(f'writing to: {file}')
                 fetch_symbols.get_file(i, f)
     else:
+        if not isinstance(service_provider, RemoteServiceDiscoveryService):
+            raise ArgumentError('service_provider must be a RemoteServiceDiscoveryService for iOS 17+ devices')
         async with RemoteFetchSymbolsService(service_provider) as fetch_symbols:
             await fetch_symbols.download(out)
 
@@ -888,9 +890,9 @@ def condition():
 
 
 @condition.command('list', cls=Command)
-def condition_list(lockdown: LockdownClient):
+def condition_list(service_provider: LockdownServiceProvider) -> None:
     """ list all available conditions """
-    with DvtSecureSocketProxyService(lockdown=lockdown) as dvt:
+    with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
         print_json(ConditionInducer(dvt).list())
 
 
@@ -1033,10 +1035,12 @@ def dvt_simulate_location_set(service_provider: LockdownClient, latitude, longit
 @click.argument('filename', type=click.Path(exists=True, file_okay=True, dir_okay=False))
 @click.argument('timing_randomness_range', type=click.INT, default=0)
 @click.option('--disable-sleep', is_flag=True, default=False)
-def dvt_simulate_location_play(service_provider: LockdownClient, filename: str, timing_randomness_range: int, disable_sleep: bool) -> None:
+def dvt_simulate_location_play(service_provider: LockdownClient, filename: str, timing_randomness_range: int,
+                               disable_sleep: bool) -> None:
     """ play a .gpx file """
     with DvtSecureSocketProxyService(service_provider) as dvt:
-        LocationSimulation(dvt).play_gpx_file(filename, disable_sleep=disable_sleep, timing_randomness_range=timing_randomness_range)
+        LocationSimulation(dvt).play_gpx_file(filename, disable_sleep=disable_sleep,
+                                              timing_randomness_range=timing_randomness_range)
         OSUTILS.wait_return()
 
 
@@ -1044,6 +1048,66 @@ def dvt_simulate_location_play(service_provider: LockdownClient, filename: str, 
 def core_device() -> None:
     """ core-device options """
     pass
+
+
+async def core_device_list_directory_task(
+        service_provider: RemoteServiceDiscoveryService, domain: str, path: str) -> None:
+    async with FileServiceService(service_provider, APPLE_DOMAIN_DICT[domain]) as file_service:
+        print_json(await file_service.retrieve_directory_list(path))
+
+
+@core_device.command('list-directory', cls=RSDCommand)
+@click.argument('domain', type=click.Choice(APPLE_DOMAIN_DICT.keys()))
+@click.argument('path')
+def core_device_list_directory(
+        service_provider: RemoteServiceDiscoveryService, domain: str, path: str) -> None:
+    """ List directory at given domain-path """
+    asyncio.run(core_device_list_directory_task(service_provider, domain, path))
+
+
+async def core_device_read_file_task(
+        service_provider: RemoteServiceDiscoveryService, domain: str, path: str, output: Optional[IO]) -> None:
+    async with FileServiceService(service_provider, APPLE_DOMAIN_DICT[domain]) as file_service:
+        buf = await file_service.retrieve_file(path)
+        if output is not None:
+            output.write(buf)
+        else:
+            print(try_decode(buf))
+
+
+@core_device.command('read-file', cls=RSDCommand)
+@click.argument('domain', type=click.Choice(APPLE_DOMAIN_DICT.keys()))
+@click.argument('path')
+@click.option('-o', '--output', type=click.File('wb'))
+def core_device_read_file(
+        service_provider: RemoteServiceDiscoveryService, domain: str, path: str, output: Optional[IO]) -> None:
+    """ Read file from given domain-path """
+    asyncio.run(core_device_read_file_task(service_provider, domain, path, output))
+
+
+async def core_device_list_launch_application_task(
+        service_provider: RemoteServiceDiscoveryService, bundle_identifier: str, argument: List[str],
+        kill_existing: bool, suspended: bool, env: List[Tuple[str, str]]) -> None:
+    async with AppServiceService(service_provider) as app_service:
+        print_json(await app_service.launch_application(bundle_identifier, argument, kill_existing,
+                                                        suspended, dict(env)))
+
+
+@core_device.command('launch-application', cls=RSDCommand)
+@click.argument('bundle_identifier')
+@click.argument('argument', nargs=-1)
+@click.option('--kill-existing/--no-kill-existing', default=True,
+              help='Whether to kill an existing instance of this process')
+@click.option('--suspended', is_flag=True, help='Same as WaitForDebugger')
+@click.option('--env', multiple=True, type=click.Tuple((str, str)),
+              help='Environment variables to pass to process given as a list of key value')
+def core_device_launch_application(
+        service_provider: RemoteServiceDiscoveryService, bundle_identifier: str, argument: Tuple[str],
+        kill_existing: bool, suspended: bool, env: List[Tuple[str, str]]) -> None:
+    """ Launch application """
+    asyncio.run(
+        core_device_list_launch_application_task(
+            service_provider, bundle_identifier, list(argument), kill_existing, suspended, env))
 
 
 async def core_device_list_processes_task(service_provider: RemoteServiceDiscoveryService) -> None:

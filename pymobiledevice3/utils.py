@@ -1,9 +1,12 @@
 import asyncio
 import traceback
 from functools import wraps
+from pathlib import Path
 from typing import Callable
 
+import requests
 from construct import Int8ul, Int16ul, Int32ul, Int64ul, Select
+from tqdm import tqdm
 
 
 def plist_access_path(d, path: tuple, type_=None, required=False):
@@ -52,7 +55,7 @@ def asyncio_print_traceback(f: Callable):
 
 def get_asyncio_loop() -> asyncio.AbstractEventLoop:
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if loop.is_closed():
             raise RuntimeError('The existing loop is closed.')
     except RuntimeError:
@@ -60,3 +63,18 @@ def get_asyncio_loop() -> asyncio.AbstractEventLoop:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     return loop
+
+
+def file_download(url: str, outfile: Path, chunk_size=1024) -> None:
+    resp = requests.get(url, stream=True)
+    total = int(resp.headers.get('content-length', 0))
+    with outfile.open('wb') as file, tqdm(
+            desc=outfile.name,
+            total=total,
+            unit='iB',
+            unit_scale=True,
+            unit_divisor=1024,
+    ) as bar:
+        for data in resp.iter_content(chunk_size=chunk_size):
+            size = file.write(data)
+            bar.update(size)

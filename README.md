@@ -162,7 +162,7 @@ Commands:
   power-assertion  Create a power assertion (wraps...
   processes        processes cli
   profile          profile options
-  provision        privision options
+  provision        provision options
   remote           remote options
   restore          restore options
   springboard      springboard options
@@ -239,6 +239,7 @@ simplify the work with developer services. You can now try to execute any of the
 ```shell
 # Accessing the DVT services
 # The --tunnel option may accept either an empty string, or a UDID for a specific device 
+# The UDID may be suffixed with :PORT in case tunneld in serving at a non-default port 
 python3 -m pymobiledevice3 developer dvt ls / --tunnel ''
 
 # Or simply without the `--tunnel` option, assuming the tunneld is running
@@ -292,8 +293,8 @@ pymobiledevice3 backup2 backup --full DIRECTORY
 # Restore a given backup
 pymobiledevice3 backup2 restore DIRECTORY
 
-# Perform a software upate by a given IPSW file:
-pymobiledevice3 restore update /path/to/ipsw
+# Perform a software upate by a given IPSW file/url:
+pymobiledevice3 restore update -i /path/to/ipsw | url
 
 # Note: The following webinspector subcommands will require the Web Inspector feature to be turned on
 
@@ -389,7 +390,7 @@ This work is licensed under GPL 3.0, and as, credited to several major contribut
 
 - Hector Martin "marcan" <hector@marcansoft.com>
 - Mathieu Renard
-- doronz <doron88@gmail.com>
-- matan1008 <matan1008@gmail.com>
-- Guy Salton
-- netanelc
+- [doronz](https://github.com/doronz88) <doron88@gmail.com>
+- [matan1008](https://github.com/matan1008) <matan1008@gmail.com>
+- [Guy Salton](https://github.com/guysalt)
+- [netanelc305](https://github.com/netanelc305) <netanelc305@protonmail.com>
